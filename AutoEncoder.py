@@ -1,14 +1,20 @@
 import os
 import numpy as np
 import torch
-from torch.nn import Linear, MSELoss, BCELoss
+from torch.nn import Linear, MSELoss, BCELoss, ReLU, Dropout, Sequential
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, global_mean_pool
 from sklearn.model_selection import train_test_split
 from scipy import sparse
 from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D plotting)
+import random
+
 
 # === Dataset Loader ===
 class CarGraphDataset(Dataset):
@@ -34,28 +40,44 @@ class CarGraphDataset(Dataset):
 
         return Data(x=x, edge_index=edge_index, edge_attr=e)
 
+
 # === Model ===
 class GraphAutoEncoder(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, latent_dim):
         super().__init__()
-        self.encoder_gcn = GCNConv(in_channels, hidden_channels)
-        self.encoder_lin = Linear(hidden_channels, latent_dim)
-        self.decoder_lin = Linear(latent_dim, in_channels)
+        self.encoder = Sequential(
+            GCNConv(in_channels, hidden_channels), ReLU(),
+            GCNConv(hidden_channels, hidden_channels), ReLU(),
+            GCNConv(hidden_channels, hidden_channels), ReLU()
+        )
+        self.encoder_lin = Sequential(
+            Linear(hidden_channels, latent_dim), ReLU(), Dropout(p=0.2))
+        self.decoder_lin = Sequential(
+            Linear(latent_dim, hidden_channels), ReLU(),
+            Linear(hidden_channels, in_channels)
+        )
 
-    def encode(self, x, edge_index):
-        z = self.encoder_gcn(x, edge_index)
-        z = torch.relu(z)
-        z = self.encoder_lin(z)
-        return z
+    def encode(self, x, edge_index, batch=None):
+        for layer in self.encoder:
+            if isinstance(layer, GCNConv):
+                x = layer(x, edge_index)
+            else:
+                x = layer(x)
+        z = self.encoder_lin(x)
+        if batch is None:
+            # If batch is not provided, assume all nodes belong to one graph
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        z_graph = global_mean_pool(z, batch)
+        return z, z_graph
 
     def decode(self, z):
-        x_hat = self.decoder_lin(z)
-        a_hat = torch.sigmoid(torch.matmul(z, z.T))
-        return x_hat, a_hat
+        return self.decoder_lin(z)
 
-    def forward(self, x, edge_index):
-        z = self.encode(x, edge_index)
-        return self.decode(z)
+    def forward(self, x, edge_index, batch=None):
+        z, z_graph = self.encode(x, edge_index, batch)
+        x_hat = self.decode(z)
+        return z, x_hat, z_graph
+
 
 # === Training loop ===
 def run_epoch(model, loader, optimizer, device, train=True):
@@ -66,12 +88,17 @@ def run_epoch(model, loader, optimizer, device, train=True):
         if train:
             optimizer.zero_grad()
 
-        x_hat, a_hat = model(batch.x, batch.edge_index)
-        a_real = torch.zeros_like(a_hat)
-        a_real[batch.edge_index[0], batch.edge_index[1]] = 1.0
+        z, x_hat, z_graph = model(batch.x, batch.edge_index, batch=batch.batch)
+
+        edge_index = batch.edge_index
+        z_i = z[edge_index[0]]
+        z_j = z[edge_index[1]]
+        dot_products = (z_i * z_j).sum(dim=1)
+        adj_pred = torch.sigmoid(dot_products)
+        adj_true = torch.ones_like(adj_pred)
 
         loss_x = MSELoss()(x_hat, batch.x)
-        loss_a = BCELoss()(a_hat.view(-1), a_real.view(-1))
+        loss_a = BCELoss()(adj_pred, adj_true)
         loss = loss_x + loss_a
 
         if train:
@@ -80,6 +107,88 @@ def run_epoch(model, loader, optimizer, device, train=True):
 
         total_loss += loss.item()
     return total_loss / len(loader)
+
+
+# === Visualize original vs reconstructed geometry ===
+def plot_reconstruction(model, dataset, device, sample_idx=None):
+    model.eval()
+    idx = random.choice(range(len(dataset))) if sample_idx is None else sample_idx
+    data = dataset[idx].to(device)
+    with torch.no_grad():
+        z, x_hat, _ = model(data.x, data.edge_index,
+                            data.batch if hasattr(data, 'batch') else torch.zeros(data.x.size(0), dtype=torch.long,
+                                                                                  device=device))
+
+    x_orig = data.x.cpu().numpy()
+    x_recon = x_hat.cpu().numpy()
+
+    plt.figure(figsize=(12, 6))
+    for i in range(min(3, x_orig.shape[1])):
+        plt.subplot(1, 3, i + 1)
+        plt.plot(x_orig[:, i], label='Original', alpha=0.7)
+        plt.plot(x_recon[:, i], label='Reconstructed', linestyle='--', alpha=0.7)
+        plt.title(f'Feature {i}')
+        plt.legend()
+    plt.suptitle(f'Reconstruction for sample #{idx}')
+    plt.tight_layout()
+    plt.savefig("reconstruction_sample.png")
+    plt.close()
+
+
+# === Visualize 2D latent space ===
+def plot_latent_space(model, dataset, device):
+    model.eval()
+    zs = []
+    colors = []
+
+    for i, data in enumerate(dataset):
+        data = data.to(device)
+        batch = torch.zeros(data.x.size(0), dtype=torch.long, device=device)  # if no batch attr
+        with torch.no_grad():
+            _, _, z_graph = model(data.x, data.edge_index, batch)
+        zs.append(z_graph.squeeze(0).cpu().numpy())
+        colors.append(i)
+
+    zs = np.array(zs)
+    pca = PCA(n_components=2)
+    zs_2d = pca.fit_transform(zs)
+
+    plt.figure(figsize=(8, 6))
+    scatter = plt.scatter(zs_2d[:, 0], zs_2d[:, 1], c=colors, cmap='viridis', s=40, edgecolor='k')
+    plt.colorbar(scatter, label="Graph index")
+    plt.title("2D PCA of Graph-Level Latent Embeddings")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.tight_layout()
+    plt.savefig("latent_projection.png")
+    plt.close()
+
+
+
+def plot_geometry_comparison(x_orig_np, x_recon_np, sample_idx=None):
+    fig = plt.figure(figsize=(12, 6))
+
+    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+    ax1.scatter(x_orig_np[:, 0], x_orig_np[:, 1], x_orig_np[:, 2],
+                c='blue', s=3, label='Original')
+    ax1.set_title("Original Geometry")
+    ax1.set_xlabel("X")
+    ax1.set_ylabel("Y")
+    ax1.set_zlabel("Z")
+
+    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+    ax2.scatter(x_recon_np[:, 0], x_recon_np[:, 1], x_recon_np[:, 2],
+                c='red', s=3, label='Reconstructed')
+    ax2.set_title("Reconstructed Geometry")
+    ax2.set_xlabel("X")
+    ax2.set_ylabel("Y")
+    ax2.set_zlabel("Z")
+
+    fig.suptitle(f"Sample #{sample_idx} - Original vs Reconstructed Geometry")
+    plt.tight_layout()
+    plt.savefig(f"geometry_comparison_{sample_idx}.png")
+    plt.show()
+
 
 # === Main execution ===
 if __name__ == "__main__":
@@ -97,10 +206,10 @@ if __name__ == "__main__":
     test_loader = DataLoader(test_set, batch_size=8)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = GraphAutoEncoder(in_channels=8, hidden_channels=32, latent_dim=64).to(device)
+    model = GraphAutoEncoder(in_channels=8, hidden_channels=64, latent_dim=256).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    writer = SummaryWriter(log_dir="runs/plain_graph_ae")
+    writer = SummaryWriter(log_dir="runs/graph_ae")
     best_val_loss = float("inf")
     os.makedirs("checkpoints", exist_ok=True)
 
@@ -119,3 +228,18 @@ if __name__ == "__main__":
     model.load_state_dict(torch.load("checkpoints/best_model.pt"))
     test_loss = run_epoch(model, test_loader, optimizer, device, train=False)
     print(f"Final Test Loss: {test_loss:.4f}")
+
+    # === Visualizations ===
+    plot_latent_space(model, test_set, device)
+    plot_reconstruction(model, test_set, device)
+    # === Visualize full geometry ===
+    sample_idx = 5  # Or None for random
+    data = test_set[sample_idx].to(device)
+    model.eval()
+    with torch.no_grad():
+        _, x_hat, _ = model(data.x, data.edge_index)
+
+    x_orig_np = data.x[:, :3].cpu().numpy()
+    x_recon_np = x_hat[:, :3].cpu().numpy()
+
+    plot_geometry_comparison(x_orig_np, x_recon_np, sample_idx)
