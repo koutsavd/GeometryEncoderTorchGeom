@@ -11,6 +11,7 @@ from pathlib import Path
 from scipy import sparse
 from tqdm import tqdm
 from joblib import Parallel, delayed
+from scipy.spatial import ConvexHull
 
 
 
@@ -116,13 +117,27 @@ def visualize_point_cloud(points: np.ndarray):
 #     np.savez_compressed(save_path, x=node_features, e=edge_features, center_point=center_point, scale=scale)
 #     sparse.save_npz(adj_path, A)
 
+def calculate_Cd(flow_vector, points):
+    proj_points = points - np.outer(np.dot(points, flow_vector), flow_vector)
+    if np.allclose(flow_vector, [1, 0, 0]):
+        coords_2d = proj_points[:, [1, 2]]
+    elif np.allclose(flow_vector, [0, 1, 0]):
+        coords_2d = proj_points[:, [0, 2]]
+    else:
+        coords_2d = proj_points[:, [0, 1]]
+
+    hull = ConvexHull(coords_2d)
+    frontal_area = hull.area
+    return 0.1*frontal_area
+
 def read_preproc_save(path, n_features):
+
     mesh = trimesh.load(path)
     print(f"Loaded {len(mesh.vertices)} vertices from {path}. Mesh is watertight: {mesh.is_watertight}")
     points = mesh.vertices
     n_points = len(points)
 
-    if n_points < 1000:
+    if n_points < 5000:
         print(f"Skipping {path.name} due to small size ({n_points} points)")
         return
 
@@ -182,19 +197,21 @@ def read_preproc_save(path, n_features):
 
     A = nx.to_scipy_sparse_array(G, format='coo')
 
+    cd_value = calculate_Cd(flow_vector, points_scaled)
+    print(f"CD value: {cd_value}")
+
     export_path = Path("Graphs")
     export_path.mkdir(parents=True, exist_ok=True)
     base = Path(path).stem
-    np.savez_compressed(export_path / f"{base}.npz", x=node_features, center_point=centroid, scale=scale)
+    np.savez_compressed(export_path / f"{base}.npz", x=node_features, cd=cd_value, center_point=centroid, scale=scale)
     sparse.save_npz(export_path / f"{base}_adj.npz", A)
-
 
 if __name__ == "__main__":
     p = Path("/Users/koutsavd/PycharmProjects/Geometry_GNN/car")
     # files = list(p.rglob("*.off"))
     # for file in tqdm(files, desc="Processing OFF files"):
     #     read_preproc_save(file, 4096, 8)
-    files = list(p.rglob("*.off"))
+    files = sorted(list(p.rglob("*.off")))
     for f in files:
         read_preproc_save(f, 10)
         # Parallel(n_jobs=8)(delayed(read_preproc_save)(f, 10) for f in files)
