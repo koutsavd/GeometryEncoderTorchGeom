@@ -11,6 +11,7 @@ from pathlib import Path
 from scipy import sparse
 from tqdm import tqdm
 from joblib import Parallel, delayed
+from scipy.spatial import ConvexHull
 
 
 
@@ -116,8 +117,33 @@ def visualize_point_cloud(points: np.ndarray):
 #     np.savez_compressed(save_path, x=node_features, e=edge_features, center_point=center_point, scale=scale)
 #     sparse.save_npz(adj_path, A)
 
-def read_preproc_save(path, n_features):
-    mesh = trimesh.load(path)
+import numpy as np
+from scipy.spatial import ConvexHull
+
+def get_projected_area(points: np.ndarray, direction: np.ndarray = np.array([1, 0, 0])) -> float:
+    """
+    Estimates the frontal area by projecting a point cloud onto a plane
+    perpendicular to the direction vector (default: X-axis).
+    """
+    direction = direction / np.linalg.norm(direction)
+
+    # Create orthonormal basis
+    z_axis = direction
+    tmp = np.array([0, 0, 1]) if not np.allclose(z_axis, [0, 0, 1]) else np.array([0, 1, 0])
+    x_axis = np.cross(tmp, z_axis)
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    rotation_matrix = np.stack([x_axis, y_axis, z_axis], axis=1)
+
+    rotated = points @ rotation_matrix
+    projected = rotated[:, 1:3]  # Project to YZ-plane
+
+    # Use 2D ConvexHull to get area
+    hull = ConvexHull(projected)
+    return hull.volume  # 'volume' is area in 2D
+
+def read_preproc_save(path, model_id, n_features):
+    mesh = trimesh.load_mesh(path)
     print(f"Loaded {len(mesh.vertices)} vertices from {path}. Mesh is watertight: {mesh.is_watertight}")
     points = mesh.vertices
     n_points = len(points)
@@ -182,19 +208,22 @@ def read_preproc_save(path, n_features):
 
     A = nx.to_scipy_sparse_array(G, format='coo')
 
-    export_path = Path("Graphs")
+    cd = 0.3 * get_projected_area(points_scaled, flow_vector)
+    print(f"Projected area of {model_id} at {cd}")
+
+    export_path = Path("ShapeNetCoreGraphs")
     export_path.mkdir(parents=True, exist_ok=True)
-    base = Path(path).stem
-    np.savez_compressed(export_path / f"{base}.npz", x=node_features, center_point=centroid, scale=scale)
-    sparse.save_npz(export_path / f"{base}_adj.npz", A)
+    #base = Path(path).stem
+    np.savez_compressed(export_path / f"{model_id}.npz", x=node_features, center_point=centroid, scale=scale)
+    sparse.save_npz(export_path / f"{model_id}_adj.npz", A)
 
 
 if __name__ == "__main__":
     p = Path("/Users/koutsavd/PycharmProjects/Geometry_GNN/car")
+    # # files = list(p.rglob("*.off"))
+    # # for file in tqdm(files, desc="Processing OFF files"):
+    # #     read_preproc_save(file, 4096, 8)
     # files = list(p.rglob("*.off"))
-    # for file in tqdm(files, desc="Processing OFF files"):
-    #     read_preproc_save(file, 4096, 8)
-    files = list(p.rglob("*.off"))
-    for f in files:
-        read_preproc_save(f, 10)
-        # Parallel(n_jobs=8)(delayed(read_preproc_save)(f, 10) for f in files)
+    # for f in files:
+    #     read_preproc_save(f, 10)
+    #     # Parallel(n_jobs=8)(delayed(read_preproc_save)(f, 10) for f in files)
