@@ -115,6 +115,30 @@ def visualize_point_cloud(points: np.ndarray):
 #
 #     np.savez_compressed(save_path, x=node_features, e=edge_features, center_point=center_point, scale=scale)
 #     sparse.save_npz(adj_path, A)
+from scipy.spatial import ConvexHull
+
+def get_projected_area(points: np.ndarray, direction: np.ndarray = np.array([1, 0, 0])) -> float:
+    """
+    Estimates the frontal area by projecting a point cloud onto a plane
+    perpendicular to the direction vector (default: X-axis).
+    """
+    direction = direction / np.linalg.norm(direction)
+
+    # Create orthonormal basis
+    z_axis = direction
+    tmp = np.array([0, 0, 1]) if not np.allclose(z_axis, [0, 0, 1]) else np.array([0, 1, 0])
+    x_axis = np.cross(tmp, z_axis)
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    rotation_matrix = np.stack([x_axis, y_axis, z_axis], axis=1)
+
+    rotated = points @ rotation_matrix
+    projected = rotated[:, 1:3]  # Project to YZ-plane
+
+    # Use 2D ConvexHull to get area
+    hull = ConvexHull(projected)
+    return hull.volume  # 'volume' is area in 2D
+
 
 def read_preproc_save(path, n_features):
     mesh = trimesh.load(path)
@@ -181,11 +205,13 @@ def read_preproc_save(path, n_features):
         node_features[i, 9] = topo[i]
 
     A = nx.to_scipy_sparse_array(G, format='coo')
+    cd = 0.3 * get_projected_area(points_scaled,flow_vector)
+    print(f"Cd is = {cd}")
 
-    export_path = Path("Graphs")
+    export_path = Path("ShapeNetCoreGraphs")
     export_path.mkdir(parents=True, exist_ok=True)
     base = Path(path).stem
-    np.savez_compressed(export_path / f"{base}.npz", x=node_features, center_point=centroid, scale=scale)
+    np.savez_compressed(export_path / f"{base}.npz", x=node_features, center_point=centroid, cd_value = cd, scale=scale)
     sparse.save_npz(export_path / f"{base}_adj.npz", A)
 
 
